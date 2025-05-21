@@ -1,0 +1,15 @@
+import socket
+
+def port_scanner(target, ports):
+	print(f"Scanning (target)...")
+	for port in ports:
+		s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		socket.setdefaulttimeout(1)
+		result = s.connect_ex((target, port))
+		if result == 0:
+			print(f"Port (port) is open")
+		s.close()
+
+target_ip = '191.777.1.1'
+ports_to_scan = [22, 80, 443]
+port_scanner(target_ip, ports_to_scan)
