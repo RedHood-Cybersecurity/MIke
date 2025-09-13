@@ -1,0 +1,31 @@
+function Get-SampleInfo {
+    <#
+    .SYNOPSIS
+        Demonstrates structure of a PowerSploit-style module (safe example).
+    .DESCRIPTION
+        Collects basic system info instead of offensive actions.
+    #>
+
+    [CmdletBinding()]
+    Param (
+        [Parameter(Mandatory=$false)]
+        [string]$ComputerName = $env:COMPUTERNAME
+    )
+
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ComputerName $ComputerName
+        $cpu = Get-CimInstance Win32_Processor -ComputerName $ComputerName
+
+        $result = [PSCustomObject]@{
+            ComputerName = $ComputerName
+            OSVersion    = $os.Version
+            CPUName      = $cpu.Name
+        }
+
+        return $result
+    }
+    catch {
+        Write-Error "Failed to query $ComputerName : $_"
+    }
+}
+
