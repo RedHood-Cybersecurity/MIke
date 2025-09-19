@@ -1,0 +1,88 @@
+from dataclasses import dataclass
+
+@dataclass
+class Application:
+    age: int
+    state: str
+    credit_score: int       # 300–850
+    claim_count_3y: int
+    annual_income: int
+    coverage_amount: int
+    product: str            # e.g., "auto", "home", "life"
+
+class Decision:
+    def __init__(self, status, risk_score, premium=None, reasons=None):
+        self.status = status          # "approve" | "refer" | "decline"
+        self.risk_score = risk_score  # 0 (low) → 100 (high)
+        self.premium = premium
+        self.reasons = reasons or []
+
+BASE_RATES = {
+    "auto": 600, "home": 900, "life": 450
+}
+
+BANNED_STATES = {"AA", "AE"}  # example restricted jurisdictions
+
+def score(app: Application):
+    """Return (risk_score, reasons)."""
+    s, reasons = 0, []
+
+    # 1) hard stops
+    if app.state in BANNED_STATES:
+        return 100, ["Restricted jurisdiction"]
+
+    # 2) age
+    if app.product == "auto" and app.age < 18:
+        return 100, ["Minimum age not met"]
+    if app.product == "life" and app.age > 75:
+        s += 35; reasons.append("Advanced age")
+
+    # 3) credit
+    if app.credit_score < 560:
+        s += 30; reasons.append("Low credit score")
+    elif app.credit_score < 650:
+        s += 15; reasons.append("Subprime credit")
+
+    # 4) prior claims
+    s += min(app.claim_count_3y * 10, 30)
+    if app.claim_count_3y > 0:
+        reasons.append(f"{app.claim_count_3y} prior claims")
+
+    # 5) affordability (coverage vs income)
+    if app.coverage_amount > app.annual_income * 10:
+        s += 25; reasons.append("Coverage too high for income")
+
+    return max(0, min(s, 100)), reasons
+
+def price(app: Application, risk_score: int):
+    """Very simple risk-loaded pricing: base * (1 + risk factor)."""
+    base = BASE_RATES.get(app.product, 800)
+    factor = 0.3 if risk_score >= 60 else (0.15 if risk_score >= 35 else 0.05)
+    return round(base * (1 + factor), 2)
+
+def underwrite(app: Application) -> Decision:
+    risk, reasons = score(app)
+
+    if "Restricted jurisdiction" in reasons or "Minimum age not met" in reasons:
+        return Decision("decline", risk, None, reasons)
+
+    if risk >= 75:
+        return Decision("decline", risk, None, reasons)
+
+    if 50 <= risk < 75:
+        premium = price(app, risk)
+        reasons = ["Borderline risk – manual review"] + reasons
+        return Decision("refer", risk, premium, reasons)
+
+    premium = price(app, risk)
+    return Decision("approve", risk, premium, reasons)
+
+# Example
+app = Application(
+    age=42, state="CA", credit_score=640,
+    claim_count_3y=1, annual_income=120_000,
+    coverage_amount=800_000, product="home"
+)
+
+decision = underwrite(app)
+print(decision.status, decision.risk_score, decision.premium, decision.reasons)
