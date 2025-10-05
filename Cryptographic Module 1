@@ -1,0 +1,162 @@
+import os, json, base64, secrets, uuid
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
+
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
+
+MAGIC = "SCONT1"  # file format magic/version
+
+def _b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("utf-8")
+
+def _b64d(s: str) -> bytes:
+    return base64.b64decode(s.encode("utf-8"))
+
+@dataclass
+class ScryptParams:
+    n: int = 2**15   # CPU/mem cost (≈32768). Increase if acceptable for your environment.
+    r: int = 8
+    p: int = 1
+    salt_len: int = 16
+
+class SecureContainer:
+    """
+    Encrypted key–value store.
+    - AES-256-GCM (cryptography AESGCM)
+    - scrypt KDF (salt per container)
+    - Whole-container encryption to minimize metadata leakage
+    - AAD binds header to ciphertext (tamper-evident)
+    """
+    def __init__(self, container_id: Optional[str] = None, items: Optional[Dict[str, Any]] = None):
+        self.container_id = container_id or str(uuid.uuid4())
+        self._items: Dict[str, Any] = items or {}
+
+    # ---------- public API ----------
+    def put(self, key: str, value: Any) -> None:
+        if not isinstance(key, str) or not key:
+            raise ValueError("Key must be a non-empty string.")
+        self._items[key] = value
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._items.get(key, default)
+
+    def delete(self, key: str) -> None:
+        self._items.pop(key, None)
+
+    def keys(self):
+        return list(self._items.keys())
+
+    def clear(self):
+        self._items.clear()
+
+    def save(self, path: str, passphrase: str, scrypt_params: ScryptParams = ScryptParams()) -> None:
+        salt = secrets.token_bytes(scrypt_params.salt_len)
+        key = self._derive_key(passphrase, salt, scrypt_params)
+        aes = AESGCM(key)
+
+        # Serialize payload (UTF-8 JSON). Avoids leaking per-item sizes/keys.
+        payload = json.dumps({
+            "container_id": self.container_id,
+            "items": self._items,
+        }, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        nonce = secrets.token_bytes(12)
+        header = {
+            "magic": MAGIC,
+            "kdf": {"name": "scrypt", "n": scrypt_params.n, "r": scrypt_params.r, "p": scrypt_params.p},
+            "salt": _b64e(salt),
+            "nonce": _b64e(nonce),
+            "container_id": self.container_id,
+        }
+        aad = json.dumps({k: header[k] for k in ("magic", "kdf", "salt", "nonce", "container_id")},
+                         separators=(",", ":")).encode("utf-8")
+        ct = aes.encrypt(nonce, payload, aad)
+
+        blob = {
+            **header,
+            "ciphertext": _b64e(ct),
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(blob, f, separators=(",", ":"))
+        os.replace(tmp, path)
+
+        # Best-effort key material cleanup
+        self._zeroize_bytes(key)
+
+    @classmethod
+    def load(cls, path: str, passphrase: str) -> "SecureContainer":
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+
+        if blob.get("magic") != MAGIC:
+            raise ValueError("Unrecognized container format.")
+        if blob.get("kdf", {}).get("name") != "scrypt":
+            raise ValueError("Unsupported KDF.")
+
+        n = int(blob["kdf"]["n"]); r = int(blob["kdf"]["r"]); p = int(blob["kdf"]["p"])
+        params = ScryptParams(n=n, r=r, p=p, salt_len=len(_b64d(blob["salt"])))
+        salt = _b64d(blob["salt"])
+        nonce = _b64d(blob["nonce"])
+        ct = _b64d(blob["ciphertext"])
+
+        key = cls._derive_key(passphrase, salt, params)
+        aes = AESGCM(key)
+
+        aad = json.dumps({k: blob[k] for k in ("magic", "kdf", "salt", "nonce", "container_id")},
+                         separators=(",", ":")).encode("utf-8")
+        try:
+            pt = aes.decrypt(nonce, ct, aad)
+        except InvalidTag as e:
+            cls._zeroize_bytes(key)
+            raise ValueError("Decryption failed: wrong passphrase or file tampered.") from e
+
+        payload = json.loads(pt.decode("utf-8"))
+        sc = cls(container_id=payload["container_id"], items=payload["items"])
+        cls._zeroize_bytes(key)
+        return sc
+
+    def rotate_passphrase(self, old_passphrase: str, new_passphrase: str, path: str, scrypt_params: ScryptParams = ScryptParams()) -> None:
+        """
+        Verify old passphrase by loading this container from disk, then save() with new passphrase.
+        """
+        current = SecureContainer.load(path, old_passphrase)  # validates old pw & integrity
+        self.container_id = current.container_id
+        self._items = current._items
+        self.save(path, new_passphrase, scrypt_params)
+
+    # ---------- internals ----------
+    @staticmethod
+    def _derive_key(passphrase: str, salt: bytes, params: ScryptParams) -> bytes:
+        # 32 bytes for AES-256
+        kdf = Scrypt(salt=salt, length=32, n=params.n, r=params.r, p=params.p)
+        return kdf.derive(passphrase.encode("utf-8"))
+
+    @staticmethod
+    def _zeroize_bytes(b: bytes):
+        # Best-effort zeroization (Python can copy/optimize; no hard guarantees).
+        try:
+            if isinstance(b, (bytes, bytearray)):
+                bb = bytearray(b)
+                for i in range(len(bb)):
+                    bb[i] = 0
+        except Exception:
+            pass
+
+# --------- quick demo ---------
+if __name__ == "__main__":
+    path = "myvault.json"
+    pw = "correct horse battery staple"
+
+    vault = SecureContainer()
+    vault.put("api_key", "sk_live_abcdef")
+    vault.put("db_password", "P@ssw0rd!123")
+    vault.put("profile", {"name": "Alice", "role": "secops"})
+    vault.save(path, pw)
+
+    # load & read
+    loaded = SecureContainer.load(path, pw)
+    print("keys:", loaded.keys())
+    print("db_password:", loaded.get("db_password"))
