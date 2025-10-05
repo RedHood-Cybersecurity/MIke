@@ -1,0 +1,275 @@
+import os, json, base64, secrets, uuid, time
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, List, Tuple
+
+# AEAD + HKDF (for KEK derivation from KEM shared secret)
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+
+# PQ KEM (Kyber) and signature (Dilithium) from pqcrypto
+# (Kyber: ML-KEM-512/768/1024; Dilithium: levels 2/3/5)
+from pqcrypto.kem.crystals_kyber512 import generate_keypair as kyber_gen, encrypt as kyber_enc, decrypt as kyber_dec
+from pqcrypto.sign.crystals_dilithium2 import generate_keypair as d2_gen, sign as d2_sign, verify as d2_verify
+
+MAGIC = "PQSCONT1"   # format/version tag
+FILE_MODE = 0o600    # suggested on POSIX
+
+def _b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("utf-8")
+
+def _b64d(s: str) -> bytes:
+    return base64.b64decode(s.encode("utf-8"))
+
+def _hkdf_ss_to_kek(shared_secret: bytes, context: bytes, outlen: int = 32) -> bytes:
+    """
+    Derive a KEK from a Kyber shared secret using HKDF-SHA-256.
+    The 'context' binds recipient id + container id + purpose.
+    """
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=outlen, salt=None, info=context)
+    return hkdf.derive(shared_secret)
+
+@dataclass
+class Recipient:
+    """
+    Recipient entry (public).
+    - 'label' is an arbitrary human-readable handle (e.g., email, device-id).
+    - 'kem_pub' is the recipient's Kyber public key (bytes).
+    """
+    label: str
+    kem_pub: bytes
+
+class PQSecureContainer:
+    """
+    Post-quantum secure container with envelope encryption:
+      - Plaintext payload -> AES-256-GCM with DEK
+      - DEK -> wrapped for each recipient using Kyber KEM-derived KEK (via HKDF)
+      - Optional Dilithium signature over the whole file for authenticity
+    """
+    def __init__(self, container_id: Optional[str] = None):
+        self.container_id = container_id or str(uuid.uuid4())
+        self._items: Dict[str, Any] = {}
+        # Optional signing keys (Dilithium)
+        self._sig_priv: Optional[bytes] = None
+        self.sig_pub: Optional[bytes] = None
+        # Optional local decapsulation key (Kyber) to unwrap DEK for ourselves
+        self._kem_priv: Optional[bytes] = None
+        self.kem_pub: Optional[bytes] = None
+
+    # --------- Key management (optional but recommended) ---------
+    def gen_signing_key(self):
+        pub, priv = d2_gen()
+        self._sig_priv, self.sig_pub = priv, pub
+
+    def import_signing_key(self, priv: bytes, pub: bytes):
+        self._sig_priv, self.sig_pub = priv, pub
+
+    def export_signing_pub(self) -> Optional[bytes]:
+        return self.sig_pub
+
+    def gen_kem_key(self):
+        pub, priv = kyber_gen()
+        self._kem_priv, self.kem_pub = priv, pub
+
+    def import_kem_key(self, priv: bytes, pub: bytes):
+        self._kem_priv, self.kem_pub = priv, pub
+
+    def export_kem_pub(self) -> Optional[bytes]:
+        return self.kem_pub
+
+    # --------- KV interface ---------
+    def put(self, key: str, value: Any) -> None:
+        if not isinstance(key, str) or not key:
+            raise ValueError("Key must be a non-empty string.")
+        self._items[key] = value
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._items.get(key, default)
+
+    def delete(self, key: str) -> None:
+        self._items.pop(key, None)
+
+    def keys(self) -> List[str]:
+        return list(self._items.keys())
+
+    def clear(self):
+        self._items.clear()
+
+    # --------- Save / Load ---------
+    def save(self, path: str, recipients: List[Recipient], sign: bool = True) -> None:
+        """
+        Encrypts the payload with a random DEK; wraps DEK for each recipient using Kyber.
+        Optionally signs the entire blob using Dilithium (if self._sig_priv is present and sign=True).
+        """
+        if not recipients:
+            raise ValueError("At least one recipient is required to wrap the DEK (include yourself if needed).")
+
+        # 1) Serialize payload (UTF-8 JSON)
+        payload = json.dumps({
+            "container_id": self.container_id,
+            "items": self._items,
+        }, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        # 2) Generate content-encryption key (DEK) and encrypt payload with AES-GCM
+        dek = secrets.token_bytes(32)
+        aead = AESGCM(dek)
+        nonce_ct = secrets.token_bytes(12)
+        header = {
+            "magic": MAGIC,
+            "container_id": self.container_id,
+            "created_at": int(time.time()),
+            "aead": {"name": "AESGCM", "key_len": 32, "nonce_len": 12},
+            "kem": {"name": "Kyber512"},
+            "sig": {"name": "Dilithium2"} if (sign and self._sig_priv and self.sig_pub) else None,
+        }
+        aad = json.dumps({k: header[k] for k in ("magic","container_id","created_at","aead","kem","sig")},
+                         separators=(",", ":")).encode("utf-8")
+        ciphertext = aead.encrypt(nonce_ct, payload, aad)
+
+        # 3) Wrap DEK for each recipient via Kyber KEM -> HKDF -> AES-GCM wrap
+        wrapped_deks = []
+        for r in recipients:
+            ct_kem, ss = kyber_enc(r.kem_pub)                   # ciphertext for recipient + shared secret
+            kek = _hkdf_ss_to_kek(ss, context=(self.container_id + "|" + r.label + "|DEK").encode("utf-8"))
+            nonce_wrap = secrets.token_bytes(12)
+            wrap_aead = AESGCM(kek)
+            ct_wrap = wrap_aead.encrypt(nonce_wrap, dek, aad)   # AAD ties to header
+            wrapped_deks.append({
+                "label": r.label,
+                "kem_pub": _b64e(r.kem_pub),    # public info (optional, helps auditing)
+                "kem_ct": _b64e(ct_kem),
+                "nonce": _b64e(nonce_wrap),
+                "dek_wrap": _b64e(ct_wrap),
+            })
+
+        blob = {
+            **header,
+            "ciphertext": _b64e(ciphertext),
+            "nonce_ct": _b64e(nonce_ct),
+            "recipients": wrapped_deks,
+            "sig_pub": _b64e(self.sig_pub) if (sign and self.sig_pub) else None,
+        }
+
+        # 4) Optional Dilithium signature over canonical JSON of (header + ct + recipients + nonce_ct + sig_pub)
+        if sign and self._sig_priv and self.sig_pub:
+            to_sign = json.dumps(blob, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            signature = d2_sign(self._sig_priv, to_sign)
+            blob["signature"] = _b64e(signature)
+
+        # 5) Write atomically
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(blob, f, separators=(",", ":"))
+        try:
+            # Restrict permissions on POSIX
+            if hasattr(os, "chmod"):
+                os.chmod(tmp, FILE_MODE)
+        except Exception:
+            pass
+        os.replace(tmp, path)
+
+        # Best-effort wipe of sensitive keys (Python can't guarantee)
+        _zeroize_bytes(dek)
+
+    @classmethod
+    def load(cls, path: str, kem_priv: Optional[bytes], expect_sig_pub: Optional[bytes] = None) -> "PQSecureContainer":
+        """
+        Load and decrypt. You must supply a Kyber private key that corresponds to one of the recipients.
+        If 'expect_sig_pub' is given, the Dilithium signature (if present) is verified against it.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+
+        if blob.get("magic") != MAGIC:
+            raise ValueError("Unrecognized container format.")
+        aad = json.dumps({k: blob[k] for k in ("magic","container_id","created_at","aead","kem","sig")},
+                         separators=(",", ":")).encode("utf-8")
+
+        # 1) If there is a signature, verify (either against embedded pub or caller-provided pub)
+        sig_b64 = blob.get("signature")
+        sig_pub_b64 = blob.get("sig_pub")
+        if sig_b64:
+            sig = _b64d(sig_b64)
+            # Choose which pub to verify with
+            if expect_sig_pub is not None:
+                sig_pub = expect_sig_pub
+            elif sig_pub_b64:
+                sig_pub = _b64d(sig_pub_b64)
+            else:
+                raise ValueError("Signature present but no public key provided/embedded for verification.")
+
+            to_verify = json.dumps({k: blob[k] for k in blob if k != "signature"},
+                                   separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            if not d2_verify(sig_pub, to_verify, sig):
+                raise ValueError("Dilithium signature verification failed.")
+
+        # 2) Find our recipient entry and unwrap DEK using Kyber decapsulation + HKDF + AES-GCM
+        if kem_priv is None:
+            raise ValueError("Kyber private key required to unwrap DEK.")
+        recipients = blob["recipients"]
+        dek = None
+        last_error = None
+        for r in recipients:
+            try:
+                kem_ct = _b64d(r["kem_ct"])
+                ss = kyber_dec(kem_priv, kem_ct)                      # recover shared secret
+                kek = _hkdf_ss_to_kek(ss, context=(blob["container_id"] + "|" + r["label"] + "|DEK").encode("utf-8"))
+                wrap_aead = AESGCM(kek)
+                dek = wrap_aead.decrypt(_b64d(r["nonce"]), _b64d(r["dek_wrap"]), aad)
+                break
+            except Exception as e:
+                last_error = e
+                continue
+        if dek is None:
+            raise ValueError(f"Unable to unwrap DEK with provided Kyber private key. Last error: {last_error}")
+
+        # 3) Decrypt payload
+        aead = AESGCM(dek)
+        pt = aead.decrypt(_b64d(blob["nonce_ct"]), _b64d(blob["ciphertext"]), aad)
+
+        payload = json.loads(pt.decode("utf-8"))
+        sc = cls(container_id=payload["container_id"])
+        sc._items = payload["items"]
+        # We don't learn author keys here; only decryptor state.
+        _zeroize_bytes(dek)
+        return sc
+
+# --------- helpers ---------
+def _zeroize_bytes(b: bytes):
+    try:
+        if isinstance(b, (bytes, bytearray)):
+            bb = bytearray(b)
+            for i in range(len(bb)):
+                bb[i] = 0
+    except Exception:
+        pass
+
+# --------- demo ---------
+if __name__ == "__main__":
+    # Alice creates a container, generates keys, and shares with herself + Bob (two recipients).
+    alice = PQSecureContainer()
+    alice.gen_kem_key()
+    alice.gen_signing_key()
+
+    # Bob has his own Kyber keypair
+    bob_pub, bob_priv = kyber_gen()
+
+    # Build recipient list (Alice self-access + Bob)
+    recipients = [
+        Recipient(label="alice@device", kem_pub=alice.kem_pub),
+        Recipient(label="bob@device",   kem_pub=bob_pub),
+    ]
+
+    # Add some secrets
+    alice.put("note", "post-quantum 👋")
+    alice.put("api_token", "sk_live_********")
+    alice.put("profile", {"name": "Alice", "role": "secops"})
+
+    # Save signed container
+    path = "pqvault.json"
+    alice.save(path, recipients=recipients, sign=True)
+
+    # Bob decrypts using his Kyber private key (and optionally checks Alice's signing pub)
+    dec = PQSecureContainer.load(path, kem_priv=bob_priv, expect_sig_pub=alice.export_signing_pub())
+    print("Decrypted keys:", dec.keys())
+    print("note:", dec.get("note"))
